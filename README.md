@@ -95,18 +95,26 @@ Locked (DRM) books, e.g. from Kindle or Adobe-protected EPUBs, can't be opened b
 | Characteristic | UUID | Use |
 |---|---|---|
 | Control | `b00c1700-0002-4b1e-8f3a-5e2d6c7a9b10` | write + notify |
-| Data | `b00c1700-0003-4b1e-8f3a-5e2d6c7a9b10` | write without response, up to ATT_MTU − 3 bytes |
+| Data | `b00c1700-0003-4b1e-8f3a-5e2d6c7a9b10` | write without response: `u32 file offset` + bytes, up to ATT_MTU − 3 in total |
 
 Control messages (little endian):
 
 | Direction | Message |
 |---|---|
 | page → BookiT | `0x01` START `u32 size` + file name · `0x02` END `u32 crc32` · `0x03` ABORT |
-| BookiT → page | `0x81` READY `u16 max chunk` · `0x82` ACK `u32 bytes saved` · `0x83` DONE `u32 size` · `0xE0` ERROR `u8 code` |
+| BookiT → page | `0x81` READY `u16 max packet` · `0x82` ACK `u32 bytes saved` · `0x83` DONE `u32 size` · `0x84` RESEND `u32 offset` · `0xE0` ERROR `u8 code` |
 
-The page keeps at most 8 KB un-acknowledged. BookiT ACKs every 4 KB **after**
-the bytes are on its SD card, writes to `name.part`, and renames it only when
-the CRC32 (IEEE) matches.
+Loss-proof transfer:
+
+- The page keeps at most 8 KB un-acknowledged. BookiT ACKs every 4 KB, and
+  whenever data stops coming, **after** the bytes are on its SD card.
+- Every data packet carries its file offset. BookiT only takes the exact next
+  offset: a gap (lost packet) or a full buffer → `RESEND` from where it is;
+  a duplicate → it repeats its last ACK (in case that ACK was lost).
+- If the page hears nothing for 3 s it goes back to the last ACK and sends again.
+- BookiT writes to `name.part` and renames it only when the CRC32 (IEEE) matches.
+- A new START always restarts cleanly (the phone's pairing prompt can hold up
+  the first answer, so the page retries START for up to 90 s).
 
 **`.bkp` page book format** (little endian): `"BKP1"`, `u16 width`, `u16 height`,
 `u32 page count`, `u32 reserved`, `u32 offset[page count + 1]`, then each page

@@ -165,7 +165,7 @@ const SVC  = "b00c1700-0001-4b1e-8f3a-5e2d6c7a9b10";
 const CTRL = "b00c1700-0002-4b1e-8f3a-5e2d6c7a9b10";
 const DATA = "b00c1700-0003-4b1e-8f3a-5e2d6c7a9b10";
 const CMD_START = 0x01, CMD_END = 0x02, CMD_ABORT = 0x03;
-const EVT_READY = 0x81, EVT_ACK = 0x82, EVT_DONE = 0x83, EVT_ERROR = 0xE0;
+const EVT_READY = 0x81, EVT_ACK = 0x82, EVT_DONE = 0x83, EVT_RESEND = 0x84, EVT_ERROR = 0xE0;
 const WINDOW = 8192;                 // max un-ACKed bytes (BOOK_RX_WINDOW)
 const ERRORS = {
   1: "BookiT is busy with another book", 2: "bad command", 3: "no SD card in BookiT",
@@ -727,11 +727,15 @@ function onNotify(event) {
   const dv = new DataView(event.target.value.buffer);
   const msg = { type: v[0] };
   if (v[0] === EVT_READY) msg.chunk = dv.getUint16(1, true);
-  if (v[0] === EVT_ACK || v[0] === EVT_DONE) msg.value = dv.getUint32(1, true);
+  if (v[0] === EVT_ACK || v[0] === EVT_DONE || v[0] === EVT_RESEND) msg.value = dv.getUint32(1, true);
   if (v[0] === EVT_ERROR) msg.code = v[1];
   if (v[0] === EVT_ACK) {
     acked = Math.max(acked, msg.value);
     setProgress(acked, bookBytes ? bookBytes.length : 0);
+  }
+  if (v[0] === EVT_RESEND) {
+    resendFrom = msg.value;                           // a packet got lost: go back
+    log("BookiT asks to resend from byte " + msg.value);
   }
   for (const w of waiters.slice()) w(msg);
 }
@@ -748,6 +752,7 @@ function waitFor(types, timeoutMs) {
 }
 
 let acked = 0;
+let resendFrom = -1;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function connect() {
@@ -818,35 +823,53 @@ async function sendBook() {
   const data = bookBytes;
   const name = outName();
   acked = 0;
+  resendFrom = -1;
   setProgress(0, data.length);
 
-  const chunk = Math.max(20, Math.min(await sendStart(data.length, name), 240));
+  // Each data packet = u32 file offset + bytes (BookiT drops anything that is
+  // not the exact next offset and asks for a RESEND).
+  const packet = Math.max(24, Math.min(await sendStart(data.length, name), 244));
+  const payload = packet - 4;
   setStatus(`Sending "${name}" (${(data.length / 1024).toFixed(0)} KB)...`);
   const t0 = performance.now();
 
-  let off = 0;
-  while (off < data.length) {
-    while (off - acked >= WINDOW) {                        // wait for BookiT to save to SD
-      const m = await waitFor([EVT_ACK], 30000);
-      if (m.type === EVT_ERROR) throw new Error(ERRORS[m.code] || "error " + m.code);
-    }
-    const end = Math.min(off + chunk, data.length);
-    // Android Chrome sometimes rejects a write when its queue is busy: retry.
-    for (let attempt = 1; ; attempt++) {
-      try {
-        await dataChar.writeValueWithoutResponse(data.slice(off, end));
-        break;
-      } catch (e) {
-        if (attempt >= 5 || !device.gatt.connected) throw new Error("Bluetooth write failed: " + e.message);
-        log(`write retry ${attempt} at byte ${off}: ${e.message}`);
-        await sleep(50 * attempt);
-      }
-    }
-    off = end;
-  }
+  let off = 0, silent = 0;
   while (acked < data.length) {
-    const m = await waitFor([EVT_ACK], 30000);
-    if (m.type === EVT_ERROR) throw new Error(ERRORS[m.code] || "error " + m.code);
+    if (resendFrom >= 0) {                                 // BookiT lost something
+      off = Math.max(resendFrom, acked);
+      resendFrom = -1;
+    }
+    if (off < data.length && off - acked < WINDOW) {
+      const end = Math.min(off + payload, data.length);
+      const pkt = new Uint8Array(4 + end - off);
+      new DataView(pkt.buffer).setUint32(0, off, true);
+      pkt.set(data.subarray(off, end), 4);
+      // Android Chrome sometimes rejects a write when its queue is busy: retry.
+      for (let attempt = 1; ; attempt++) {
+        try {
+          await dataChar.writeValueWithoutResponse(pkt);
+          break;
+        } catch (e) {
+          if (attempt >= 5 || !device.gatt.connected) throw new Error("Bluetooth write failed: " + e.message);
+          log(`write retry ${attempt} at byte ${off}: ${e.message}`);
+          await sleep(50 * attempt);
+        }
+      }
+      off = end;
+      continue;
+    }
+    // Window full (or all sent): wait for BookiT to save to SD and ACK.
+    const before = acked;
+    const m = await waitFor([EVT_ACK, EVT_RESEND], 3000).catch(() => null);
+    if (m && m.type === EVT_ERROR) throw new Error(ERRORS[m.code] || "error " + m.code);
+    if (acked > before || (m && m.type === EVT_RESEND)) {
+      silent = 0;
+    } else if (++silent >= 20) {
+      throw new Error("BookiT stopped answering");
+    } else {
+      log(`no answer for 3 s, resending from byte ${acked}`);
+      off = acked;                                         // go back to the last saved byte
+    }
   }
 
   const endPkt = new Uint8Array(5);
