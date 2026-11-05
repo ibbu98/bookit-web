@@ -117,6 +117,22 @@
       </div>
       <span class="note" id="modeWhy"></span>
     </div>
+    <div class="field" id="pdfField" hidden>
+      <span>PDF pages</span>
+      <div class="seg" id="pdffit">
+        <label><input type="radio" name="pdffit" value="whole" checked><span>Whole page</span></label>
+        <label><input type="radio" name="pdffit" value="width"><span>Fit width</span></label>
+      </div>
+      <span class="note">Whole page: each page fits on one BookiT screen (portrait pages stay portrait).
+        Fit width: bigger text, but tall pages are split into parts.</span>
+    </div>
+    <div class="field" id="orientField" hidden>
+      <span>Pages for BookiT held</span>
+      <div class="seg" id="porient">
+        <label><input type="radio" name="porient" value="portrait" checked><span>Portrait</span></label>
+        <label><input type="radio" name="porient" value="landscape"><span>Landscape</span></label>
+      </div>
+    </div>
     <div class="field" id="fontField" hidden>
       <span>Page text size</span>
       <div class="seg" id="psize">
@@ -388,48 +404,60 @@ function autoMode(src) {
 }
 
 // ---------------------------------------------------------------------------
-// Page books (.bkp): 800 x 480, 1 bit, PackBits, bottom 32 px left blank.
+// Page books (.bkp, version BKP2): 1-bit pages in BookiT's panel layout.
+// Each page is drawn for landscape (800 x 480) or portrait (480 x 800) and
+// stored in the panel's physical 800 x 480 layout. Portrait pages are turned
+// like bookit_fw/services/fb.h: phys_x = y, phys_y = 479 - x.
+// The bottom 32 px (of the page as seen) are left blank for the page number.
 // ---------------------------------------------------------------------------
 const PW = 800, PH = 480, STATUS_H = 32;
 const FONT_STACK = '"Noto Sans", "Noto Sans Arabic", "Noto Naskh Arabic", "Noto Sans Tamil", ' +
                    '"Nirmala UI", "Segoe UI", Tahoma, Arial, sans-serif';
 
-function newPageCanvas() {
+const pageSize = (portrait) => (portrait ? { w: PH, h: PW } : { w: PW, h: PH });
+
+function newPageCanvas(portrait) {
+  const { w, h } = pageSize(portrait);
   const c = document.createElement("canvas");
-  c.width = PW; c.height = PH;
+  c.width = w; c.height = h;
   const ctx = c.getContext("2d", { willReadFrequently: true });
-  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, PW, PH);
+  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, w, h);
   ctx.fillStyle = "#000";
-  return { c, ctx };
+  return { c, ctx, portrait, w, h };
 }
 
-// Canvas -> 48000 bytes (100 per row, bit 7 = left, 1 = white).
+// Page canvas -> { raw: 48000 bytes (physical layout, 1 = white), portrait }.
 // Text uses a plain threshold (crisp); pictures use Floyd-Steinberg dithering.
-function toFrame(ctx, dither) {
-  const img = ctx.getImageData(0, 0, PW, PH).data;
-  const lum = new Float32Array(PW * PH);
+function toFrame(page, dither) {
+  const { ctx, w, h, portrait } = page;
+  const img = ctx.getImageData(0, 0, w, h).data;
+  const lum = new Float32Array(w * h);
   for (let i = 0, j = 0; i < lum.length; i++, j += 4) {
     lum[i] = 0.299 * img[j] + 0.587 * img[j + 1] + 0.114 * img[j + 2];
   }
-  const frame = new Uint8Array(PW * PH / 8);
-  for (let y = 0; y < PH; y++) {
-    for (let x = 0; x < PW; x++) {
-      const i = y * PW + x;
+  const raw = new Uint8Array(PW * PH / 8);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x;
       const old = lum[i];
       const white = dither ? old >= 128 : old >= 150;
-      if (white) frame[i >> 3] |= 0x80 >> (x & 7);
+      if (white) {
+        const px = portrait ? y : x;
+        const py = portrait ? PH - 1 - x : y;
+        raw[(py * PW + px) >> 3] |= 0x80 >> (px & 7);
+      }
       if (dither) {
         const err = old - (white ? 255 : 0);
-        if (x + 1 < PW) lum[i + 1] += err * 7 / 16;
-        if (y + 1 < PH) {
-          if (x > 0) lum[i + PW - 1] += err * 3 / 16;
-          lum[i + PW] += err * 5 / 16;
-          if (x + 1 < PW) lum[i + PW + 1] += err / 16;
+        if (x + 1 < w) lum[i + 1] += err * 7 / 16;
+        if (y + 1 < h) {
+          if (x > 0) lum[i + w - 1] += err * 3 / 16;
+          lum[i + w] += err * 5 / 16;
+          if (x + 1 < w) lum[i + w + 1] += err / 16;
         }
       }
     }
   }
-  return frame;
+  return { raw, portrait };
 }
 
 // PackBits: runs of 3+ equal bytes -> (257 - n, byte); others -> (n - 1, bytes...).
@@ -456,24 +484,28 @@ function packbits(src) {
   return Uint8Array.from(out);
 }
 
+// "BKP2" header, offset table, one orientation byte per page, then pages.
 function buildBkp(frames) {
-  const packed = frames.map(packbits);
-  const tableLen = 4 * (packed.length + 1);
-  let size = 16 + tableLen;
+  const packed = frames.map((f) => packbits(f.raw));
+  const n = packed.length;
+  const orientAt = 16 + 4 * (n + 1);
+  const dataAt = (orientAt + n + 3) & ~3;                  // pad to 4 bytes
+  let size = dataAt;
   for (const p of packed) size += p.length;
   const out = new Uint8Array(size);
   const dv = new DataView(out.buffer);
-  out.set([0x42, 0x4B, 0x50, 0x31], 0);                 // "BKP1"
+  out.set([0x42, 0x4B, 0x50, 0x32], 0);                 // "BKP2"
   dv.setUint16(4, PW, true);
   dv.setUint16(6, PH, true);
-  dv.setUint32(8, packed.length, true);
-  let off = 16 + tableLen;
-  packed.forEach((p, n) => {
-    dv.setUint32(16 + 4 * n, off, true);
+  dv.setUint32(8, n, true);
+  frames.forEach((f, k) => { out[orientAt + k] = f.portrait ? 1 : 0; });
+  let off = dataAt;
+  packed.forEach((p, k) => {
+    dv.setUint32(16 + 4 * k, off, true);
     out.set(p, off);
     off += p.length;
   });
-  dv.setUint32(16 + 4 * packed.length, off, true);
+  dv.setUint32(16 + 4 * n, off, true);
   return out;
 }
 
@@ -506,32 +538,38 @@ function wrap(ctx, para, maxW) {
   return lines;
 }
 
-async function imagePage(zip, path) {
+// Draw 'source' (image / canvas, sw x sh) as large as fits, centered above the status strip.
+function drawFitted(page, source, sw, sh, margin, maxUp) {
+  const boxW = page.w - 2 * margin, boxH = page.h - STATUS_H - 2 * margin;
+  const s = Math.min(boxW / sw, boxH / sh, maxUp);
+  const w = Math.round(sw * s), h = Math.round(sh * s);
+  page.ctx.drawImage(source, (page.w - w) / 2, margin + (boxH - h) / 2, w, h);
+}
+
+async function imagePage(zip, path, portrait) {
   const f = zip && zip.file(path);
   if (!f) return null;
   try {
     const bmp = await createImageBitmap(await f.async("blob"));
-    const { ctx } = newPageCanvas();
-    const boxW = PW - 40, boxH = PH - STATUS_H - 20;
-    const s = Math.min(boxW / bmp.width, boxH / bmp.height, 3);
-    const w = Math.round(bmp.width * s), h = Math.round(bmp.height * s);
-    ctx.drawImage(bmp, (PW - w) / 2, (PH - STATUS_H - h) / 2, w, h);
-    return toFrame(ctx, true);
+    // A wide picture gets a landscape page, a tall one a portrait page.
+    const page = newPageCanvas(bmp.width > bmp.height ? false : portrait);
+    drawFitted(page, bmp, bmp.width, bmp.height, 10, 3);
+    return toFrame(page, true);
   } catch (e) {
     return null;                                        // unsupported picture type: skip it
   }
 }
 
-async function renderTextPages(src, fontPx) {
+async function renderTextPages(src, fontPx, portrait) {
   const ML = 28, MT = 18;
-  const maxW = PW - 2 * ML, bottom = PH - STATUS_H - 6;
   const lineH = Math.round(fontPx * 1.45);
   const frames = [];
-  let page = newPageCanvas(), y = MT, empty = true;
+  let page = newPageCanvas(portrait), y = MT, empty = true;
+  const maxW = page.w - 2 * ML, bottom = page.h - STATUS_H - 6;
 
   const flush = () => {
-    if (!empty) frames.push(toFrame(page.ctx, false));
-    page = newPageCanvas(); y = MT; empty = true;
+    if (!empty) frames.push(toFrame(page, false));
+    page = newPageCanvas(portrait); y = MT; empty = true;
   };
 
   const blocks = src.text.split(/\n{2,}/);
@@ -543,23 +581,22 @@ async function renderTextPages(src, fontPx) {
     }
     const img = /^\u0001IMG:([^\u0001]*)\u0001$/.exec(block.trim());
     if (img) {
-      const frame = await imagePage(src.zip, img[1]);
+      const frame = await imagePage(src.zip, img[1], portrait);
       if (frame) { flush(); frames.push(frame); }
       continue;
     }
     const para = block.replace(/\s+/g, " ").trim();
     if (!para) continue;
-    const ctx = page.ctx;
-    ctx.font = `${fontPx}px ${FONT_STACK}`;
+    page.ctx.font = `${fontPx}px ${FONT_STACK}`;
     const rtl = firstStrongIsRtl(para);
-    for (const line of wrap(ctx, para, maxW)) {
+    for (const line of wrap(page.ctx, para, maxW)) {
       if (y + lineH > bottom) flush();
       const c = page.ctx;
       c.font = `${fontPx}px ${FONT_STACK}`;
       c.textBaseline = "top";
       c.direction = rtl ? "rtl" : "ltr";
       c.textAlign = rtl ? "right" : "left";
-      c.fillText(line, rtl ? PW - ML : ML, y);
+      c.fillText(line, rtl ? page.w - ML : ML, y);
       y += lineH;
       empty = false;
     }
@@ -569,44 +606,70 @@ async function renderTextPages(src, fontPx) {
   return frames;
 }
 
-// PDF: fit each page to the screen width and cut it into screen-high strips.
-async function renderPdfPages(pdf) {
+async function renderPdfPage(page, scale) {
+  const vp = page.getViewport({ scale });
+  const c = document.createElement("canvas");
+  c.width = Math.ceil(vp.width); c.height = Math.ceil(vp.height);
+  const cctx = c.getContext("2d");
+  cctx.fillStyle = "#fff"; cctx.fillRect(0, 0, c.width, c.height);
+  await page.render({ canvasContext: cctx, viewport: vp }).promise;
+  return c;
+}
+
+// PDF pages.
+//  "whole": every page fits whole on one screen, in its own shape (a tall
+//           page becomes a portrait page, a wide page a landscape page).
+//  "width": landscape screens, page fitted to the width and cut into strips.
+async function renderPdfPages(pdf, fit) {
   const frames = [];
-  const usableH = PH - STATUS_H, overlap = 24, left = 12, width = PW - 2 * left;
   for (let p = 1; p <= pdf.numPages; p++) {
     setStatusConv(`Drawing PDF page ${p} of ${pdf.numPages}...`);
     const page = await pdf.getPage(p);
     const vp1 = page.getViewport({ scale: 1 });
-    const scale = Math.min(width / vp1.width, 3);
-    const vp = page.getViewport({ scale });
-    const c = document.createElement("canvas");
-    c.width = Math.ceil(vp.width); c.height = Math.ceil(vp.height);
-    const cctx = c.getContext("2d");
-    cctx.fillStyle = "#fff"; cctx.fillRect(0, 0, c.width, c.height);
-    await page.render({ canvasContext: cctx, viewport: vp }).promise;
+
+    if (fit === "whole") {
+      const target = newPageCanvas(vp1.height >= vp1.width);
+      const margin = 4;
+      const scale = Math.min((target.w - 2 * margin) / vp1.width,
+                             (target.h - STATUS_H - 2 * margin) / vp1.height, 4);
+      const c = await renderPdfPage(page, scale);
+      drawFitted(target, c, c.width, c.height, margin, 1);
+      frames.push(toFrame(target, true));
+      continue;
+    }
+
+    const usableH = PH - STATUS_H, overlap = 24, left = 12, width = PW - 2 * left;
+    const c = await renderPdfPage(page, Math.min(width / vp1.width, 3));
     for (let top = 0; top < c.height; top += usableH - overlap) {
-      const { ctx } = newPageCanvas();
+      const target = newPageCanvas(false);
       const h = Math.min(usableH, c.height - top);
-      ctx.drawImage(c, 0, top, c.width, h, left + (width - c.width) / 2, 0, c.width, h);
-      frames.push(toFrame(ctx, true));
+      target.ctx.drawImage(c, 0, top, c.width, h, left + (width - c.width) / 2, 0, c.width, h);
+      frames.push(toFrame(target, true));
       if (top + usableH >= c.height) break;
     }
   }
   return frames;
 }
 
+// Show the first pages exactly as BookiT will (turned back to how they are seen).
 function showPagePreview(frames) {
   const box = $("pagePreview");
   box.innerHTML = "";
   for (const f of frames.slice(0, 4)) {
+    const { w, h } = pageSize(f.portrait);
     const c = document.createElement("canvas");
-    c.width = PW; c.height = PH;
+    c.width = w; c.height = h;
     const ctx = c.getContext("2d");
-    const img = ctx.createImageData(PW, PH);
-    for (let i = 0; i < PW * PH; i++) {
-      const v = (f[i >> 3] & (0x80 >> (i & 7))) ? 255 : 0;
-      img.data[4 * i] = img.data[4 * i + 1] = img.data[4 * i + 2] = v;
-      img.data[4 * i + 3] = 255;
+    const img = ctx.createImageData(w, h);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const px = f.portrait ? y : x;
+        const py = f.portrait ? PH - 1 - x : y;
+        const v = (f.raw[(py * PW + px) >> 3] & (0x80 >> (px & 7))) ? 255 : 0;
+        const i = 4 * (y * w + x);
+        img.data[i] = img.data[i + 1] = img.data[i + 2] = v;
+        img.data[i + 3] = 255;
+      }
     }
     ctx.putImageData(img, 0, 0);
     box.appendChild(c);
@@ -637,7 +700,10 @@ async function build() {
   $("modeWhy").textContent = choice === "auto" ? auto.why
     : mode === "text" ? "Text: non-English letters will be simplified or shown as ?."
     : "Pages: drawn here exactly as they will look on BookiT.";
-  $("fontField").hidden = !(mode === "pages" && source.kind !== "pdf");
+  const drawnText = mode === "pages" && source.kind !== "pdf";
+  $("fontField").hidden = !drawnText;
+  $("orientField").hidden = !drawnText;
+  $("pdfField").hidden = !(mode === "pages" && source.kind === "pdf");
 
   try {
     if (mode === "text") {
@@ -654,8 +720,8 @@ async function build() {
     } else {
       setStatusConv("Drawing pages...");
       const src = $("stripGut").checked ? { ...source, text: stripGutenberg(source.text) } : source;
-      const frames = source.kind === "pdf" ? await renderPdfPages(source.pdf)
-                                           : await renderTextPages(src, parseInt(radio("psize"), 10));
+      const frames = source.kind === "pdf" ? await renderPdfPages(source.pdf, radio("pdffit"))
+                                           : await renderTextPages(src, parseInt(radio("psize"), 10), radio("porient") === "portrait");
       if (ticket !== building) return;                  // options changed meanwhile
       if (!frames.length) throw new Error("Nothing to show.");
       bookBytes = buildBkp(frames);
@@ -690,7 +756,7 @@ $("file").addEventListener("change", async (e) => {
   }
 });
 
-for (const el of document.querySelectorAll("input[name=mode], input[name=psize]")) {
+for (const el of document.querySelectorAll("input[name=mode], input[name=psize], input[name=pdffit], input[name=porient]")) {
   el.addEventListener("change", build);
 }
 $("stripGut").addEventListener("change", build);

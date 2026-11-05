@@ -67,9 +67,14 @@ You can force **Text** or **Pages** by hand.
 
 - Text books are cleaned to plain ASCII (curly quotes → `"`, dashes → `-`,
   `é` → `e`). Pictures become `[Image]`.
-- Page books: 800 × 480 pixels, 1 bit per pixel (black / white). Text is drawn
-  sharp; pictures are dithered (newspaper-style dots). PDFs are fitted to the
-  screen width and cut into screen-high strips so the text stays readable.
+- Page books: 1 bit per pixel (black / white), each page drawn for **portrait
+  (480 × 800)** or **landscape (800 × 480)**. Text is drawn sharp; pictures are
+  dithered (newspaper-style dots).
+- PDFs: **Whole page** (default) fits every page whole on one screen in its own
+  shape, so a portrait Quran page stays one portrait page. **Fit width** gives
+  bigger text but cuts tall pages into strips.
+- On BookiT, *Settings → Orientation* turns the whole device. A page whose shape
+  doesn't match is shrunk to fit whole; switch Orientation to see it full size.
 
 ## What you need
 
@@ -116,10 +121,14 @@ Loss-proof transfer:
 - A new START always restarts cleanly (the phone's pairing prompt can hold up
   the first answer, so the page retries START for up to 90 s).
 
-**`.bkp` page book format** (little endian): `"BKP1"`, `u16 width`, `u16 height`,
-`u32 page count`, `u32 reserved`, `u32 offset[page count + 1]`, then each page
-as a PackBits-compressed 48 000-byte frame (100 bytes per row, bit 7 = leftmost
-pixel, 1 = white). The bottom 32 rows are left blank for BookiT's page number.
+**`.bkp` page book format (BKP2)** (little endian): `"BKP2"`, `u16 width (800)`, `u16 height (480)`,
+`u32 page count`, `u32 reserved`, `u32 offset[page count + 1]`, `u8 portrait[page count]`
+(1 = page drawn as 480 x 800 portrait), padding to 4 bytes, then each page as a
+PackBits-compressed 48 000-byte frame in the panel's physical 800 x 480 layout
+(100 bytes per row, bit 7 = leftmost pixel, 1 = white). Portrait pages are stored
+turned: physical x = y, physical y = 479 - x. The bottom 32 rows of each page (as
+seen) are left blank for BookiT's page number. Older `"BKP1"` files (no portrait
+table, all landscape) still open.
 
 Libraries loaded from cdnjs: [pdf.js](https://mozilla.github.io/pdf.js/) 3.11.174
 (Apache-2.0) and [JSZip](https://stuk.github.io/jszip/) 3.10.1 (MIT).
