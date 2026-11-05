@@ -73,7 +73,8 @@ You can force **Text** or **Pages** by hand.
 - **Both orientations (default):** the page makes two sets of pages in one file,
   one for BookiT held **portrait** and one for **landscape**. BookiT shows the set
   that matches *Settings → Orientation* and keeps your place when you switch.
-  - PDFs: portrait = every page **whole** on one screen; landscape = tall pages
+  - PDFs: the PDF's own white margins are cropped first, so the printed area
+    fills the screen. Portrait = every page **whole** on one screen; landscape = tall pages
     fitted to the width (in 2-3 parts, bigger text), wide pages whole.
   - Drawn text (Arabic, Tamil, ...): laid out separately for each shape.
   - The file is about twice as big. Choose *Portrait* or *Landscape* only to
@@ -111,8 +112,8 @@ Control messages (little endian):
 
 | Direction | Message |
 |---|---|
-| page → BookiT | `0x01` START `u32 size` + file name · `0x02` END `u32 crc32` · `0x03` ABORT |
-| BookiT → page | `0x81` READY `u16 max packet` · `0x82` ACK `u32 bytes saved` · `0x83` DONE `u32 size` · `0x84` RESEND `u32 offset` · `0xE0` ERROR `u8 code` |
+| page → BookiT | `0x01` START `u32 size` `u8 mode` + file name (mode 0 = ask if it exists, 1 = replace, 2 = keep both as "name (2)") · `0x02` END `u32 crc32` · `0x03` ABORT |
+| BookiT → page | `0x81` READY `u16 max packet` · `0x82` ACK `u32 bytes saved` · `0x83` DONE `u32 size` · `0x84` RESEND `u32 offset` · `0x85` EXISTS (a book with this name is already there; the page asks *Replace it* / *Keep both*) · `0xE0` ERROR `u8 code` |
 
 Loss-proof transfer:
 
