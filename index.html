@@ -117,21 +117,15 @@
       </div>
       <span class="note" id="modeWhy"></span>
     </div>
-    <div class="field" id="pdfField" hidden>
-      <span>PDF pages</span>
-      <div class="seg" id="pdffit">
-        <label><input type="radio" name="pdffit" value="whole" checked><span>Whole page</span></label>
-        <label><input type="radio" name="pdffit" value="width"><span>Fit width</span></label>
+    <div class="field" id="setsField" hidden>
+      <span>Make pages for BookiT held</span>
+      <div class="seg" id="psets">
+        <label><input type="radio" name="psets" value="both" checked><span>Both</span></label>
+        <label><input type="radio" name="psets" value="portrait"><span>Portrait</span></label>
+        <label><input type="radio" name="psets" value="landscape"><span>Landscape</span></label>
       </div>
-      <span class="note">Whole page: each page fits on one BookiT screen (portrait pages stay portrait).
-        Fit width: bigger text, but tall pages are split into parts.</span>
-    </div>
-    <div class="field" id="orientField" hidden>
-      <span>Pages for BookiT held</span>
-      <div class="seg" id="porient">
-        <label><input type="radio" name="porient" value="portrait" checked><span>Portrait</span></label>
-        <label><input type="radio" name="porient" value="landscape"><span>Landscape</span></label>
-      </div>
+      <span class="note">Both: BookiT shows the right pages whichever way you hold it (file about twice as big).
+        PDF pages are whole in portrait, and fitted to the width (in parts) in landscape.</span>
     </div>
     <div class="field" id="fontField" hidden>
       <span>Page text size</span>
@@ -167,6 +161,7 @@
   <p class="note"><b>Text</b> books are small and their font size can be changed on BookiT (English only).
   <b>Pages</b> books are drawn here, page by page: any language (Arabic, Tamil, ...), pictures and PDFs.
   Locked (DRM) books can't be opened by anyone.</p>
+  <p class="note" id="version">BookiT Sender version 2026-11-05 (pages for portrait + landscape)</p>
 </main>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
@@ -460,6 +455,12 @@ function toFrame(page, dither) {
   return { raw, portrait };
 }
 
+// Compress right away so long books don't fill the phone's memory; keep the
+// unpacked page only for the preview.
+function packFrame(frame, keepForPreview) {
+  return { packed: packbits(frame.raw), portrait: frame.portrait, raw: keepForPreview ? frame.raw : null };
+}
+
 // PackBits: runs of 3+ equal bytes -> (257 - n, byte); others -> (n - 1, bytes...).
 function packbits(src) {
   const out = [];
@@ -485,8 +486,9 @@ function packbits(src) {
 }
 
 // "BKP2" header, offset table, one orientation byte per page, then pages.
+// BookiT expects each orientation's pages as one block (portrait set, then landscape set).
 function buildBkp(frames) {
-  const packed = frames.map((f) => packbits(f.raw));
+  const packed = frames.map((f) => f.packed || packbits(f.raw));
   const n = packed.length;
   const orientAt = 16 + 4 * (n + 1);
   const dataAt = (orientAt + n + 3) & ~3;                  // pad to 4 bytes
@@ -552,7 +554,7 @@ async function imagePage(zip, path, portrait) {
   try {
     const bmp = await createImageBitmap(await f.async("blob"));
     // A wide picture gets a landscape page, a tall one a portrait page.
-    const page = newPageCanvas(bmp.width > bmp.height ? false : portrait);
+    const page = newPageCanvas(portrait);
     drawFitted(page, bmp, bmp.width, bmp.height, 10, 3);
     return toFrame(page, true);
   } catch (e) {
@@ -568,7 +570,7 @@ async function renderTextPages(src, fontPx, portrait) {
   const maxW = page.w - 2 * ML, bottom = page.h - STATUS_H - 6;
 
   const flush = () => {
-    if (!empty) frames.push(toFrame(page, false));
+    if (!empty) frames.push(packFrame(toFrame(page, false), frames.length < 2));
     page = newPageCanvas(portrait); y = MT; empty = true;
   };
 
@@ -582,7 +584,7 @@ async function renderTextPages(src, fontPx, portrait) {
     const img = /^\u0001IMG:([^\u0001]*)\u0001$/.exec(block.trim());
     if (img) {
       const frame = await imagePage(src.zip, img[1], portrait);
-      if (frame) { flush(); frames.push(frame); }
+      if (frame) { flush(); frames.push(packFrame(frame, frames.length < 2)); }
       continue;
     }
     const para = block.replace(/\s+/g, " ").trim();
@@ -616,46 +618,61 @@ async function renderPdfPage(page, scale) {
   return c;
 }
 
-// PDF pages.
-//  "whole": every page fits whole on one screen, in its own shape (a tall
-//           page becomes a portrait page, a wide page a landscape page).
-//  "width": landscape screens, page fitted to the width and cut into strips.
-async function renderPdfPages(pdf, fit) {
-  const frames = [];
+// One PDF page fitted whole onto a page of the given orientation.
+async function pdfWhole(page, vp1, portrait) {
+  const target = newPageCanvas(portrait);
+  const margin = 4;
+  const scale = Math.min((target.w - 2 * margin) / vp1.width,
+                         (target.h - STATUS_H - 2 * margin) / vp1.height, 4);
+  const c = await renderPdfPage(page, scale);
+  drawFitted(target, c, c.width, c.height, margin, 1);
+  return toFrame(target, true);
+}
+
+// One tall PDF page fitted to the width of landscape pages, cut into parts
+// (with a small overlap so no line is lost at a cut).
+async function pdfStrips(page, vp1) {
+  const out = [];
+  const usableH = PH - STATUS_H, overlap = 24, left = 12, width = PW - 2 * left;
+  const c = await renderPdfPage(page, Math.min(width / vp1.width, 3));
+  for (let top = 0; top < c.height; top += usableH - overlap) {
+    const target = newPageCanvas(false);
+    const h = Math.min(usableH, c.height - top);
+    target.ctx.drawImage(c, 0, top, c.width, h, left + (width - c.width) / 2, 0, c.width, h);
+    out.push(toFrame(target, true));
+    if (top + usableH >= c.height) break;
+  }
+  return out;
+}
+
+// PDF pages for BookiT held portrait and/or landscape.
+//  portrait set : every page whole on one screen
+//  landscape set: tall pages fitted to the width (in parts, bigger text);
+//                 wide pages whole
+// Returned as one list: all portrait pages first, then all landscape pages.
+async function renderPdfPages(pdf, wantPortrait, wantLandscape) {
+  const portraitSet = [], landscapeSet = [];
   for (let p = 1; p <= pdf.numPages; p++) {
     setStatusConv(`Drawing PDF page ${p} of ${pdf.numPages}...`);
     const page = await pdf.getPage(p);
     const vp1 = page.getViewport({ scale: 1 });
-
-    if (fit === "whole") {
-      const target = newPageCanvas(vp1.height >= vp1.width);
-      const margin = 4;
-      const scale = Math.min((target.w - 2 * margin) / vp1.width,
-                             (target.h - STATUS_H - 2 * margin) / vp1.height, 4);
-      const c = await renderPdfPage(page, scale);
-      drawFitted(target, c, c.width, c.height, margin, 1);
-      frames.push(toFrame(target, true));
-      continue;
+    const tall = vp1.height >= vp1.width;
+    if (wantPortrait) {
+      portraitSet.push(packFrame(await pdfWhole(page, vp1, true), portraitSet.length < 2));
     }
-
-    const usableH = PH - STATUS_H, overlap = 24, left = 12, width = PW - 2 * left;
-    const c = await renderPdfPage(page, Math.min(width / vp1.width, 3));
-    for (let top = 0; top < c.height; top += usableH - overlap) {
-      const target = newPageCanvas(false);
-      const h = Math.min(usableH, c.height - top);
-      target.ctx.drawImage(c, 0, top, c.width, h, left + (width - c.width) / 2, 0, c.width, h);
-      frames.push(toFrame(target, true));
-      if (top + usableH >= c.height) break;
+    if (wantLandscape) {
+      const frames = tall ? await pdfStrips(page, vp1) : [await pdfWhole(page, vp1, false)];
+      for (const f of frames) landscapeSet.push(packFrame(f, landscapeSet.length < 2));
     }
   }
-  return frames;
+  return portraitSet.concat(landscapeSet);
 }
 
 // Show the first pages exactly as BookiT will (turned back to how they are seen).
 function showPagePreview(frames) {
   const box = $("pagePreview");
   box.innerHTML = "";
-  for (const f of frames.slice(0, 4)) {
+  for (const f of frames.filter((fr) => fr.raw).slice(0, 4)) {
     const { w, h } = pageSize(f.portrait);
     const c = document.createElement("canvas");
     c.width = w; c.height = h;
@@ -700,10 +717,8 @@ async function build() {
   $("modeWhy").textContent = choice === "auto" ? auto.why
     : mode === "text" ? "Text: non-English letters will be simplified or shown as ?."
     : "Pages: drawn here exactly as they will look on BookiT.";
-  const drawnText = mode === "pages" && source.kind !== "pdf";
-  $("fontField").hidden = !drawnText;
-  $("orientField").hidden = !drawnText;
-  $("pdfField").hidden = !(mode === "pages" && source.kind === "pdf");
+  $("fontField").hidden = !(mode === "pages" && source.kind !== "pdf");
+  $("setsField").hidden = mode !== "pages";
 
   try {
     if (mode === "text") {
@@ -720,15 +735,25 @@ async function build() {
     } else {
       setStatusConv("Drawing pages...");
       const src = $("stripGut").checked ? { ...source, text: stripGutenberg(source.text) } : source;
-      const frames = source.kind === "pdf" ? await renderPdfPages(source.pdf, radio("pdffit"))
-                                           : await renderTextPages(src, parseInt(radio("psize"), 10), radio("porient") === "portrait");
+      const sets = radio("psets");
+      const wantP = sets !== "landscape", wantL = sets !== "portrait";
+      let frames;
+      if (source.kind === "pdf") {
+        frames = await renderPdfPages(source.pdf, wantP, wantL);
+      } else {
+        const size = parseInt(radio("psize"), 10);
+        frames = (wantP ? await renderTextPages(src, size, true) : [])
+          .concat(wantL ? await renderTextPages(src, size, false) : []);   // portrait set first
+      }
       if (ticket !== building) return;                  // options changed meanwhile
       if (!frames.length) throw new Error("Nothing to show.");
       bookBytes = buildBkp(frames);
       bookExt = ".bkp";
       showPagePreview(frames);
+      const nP = frames.filter((f) => f.portrait).length, nL = frames.length - nP;
+      const parts = [nP ? `${nP} portrait` : "", nL ? `${nL} landscape` : ""].filter(Boolean).join(" + ");
       const mins = Math.max(1, Math.round(bookBytes.length / 15000 / 60));
-      setStatusConv(`Page book: ${frames.length} pages, ${(bookBytes.length / 1024).toFixed(0)} KB ` +
+      setStatusConv(`Page book: ${parts} pages, ${(bookBytes.length / 1024).toFixed(0)} KB ` +
                     `(about ${mins} min to send). First pages:`);
     }
     if (ticket === building) $("sendCard").hidden = false;
@@ -756,7 +781,7 @@ $("file").addEventListener("change", async (e) => {
   }
 });
 
-for (const el of document.querySelectorAll("input[name=mode], input[name=psize], input[name=pdffit], input[name=porient]")) {
+for (const el of document.querySelectorAll("input[name=mode], input[name=psize], input[name=psets]")) {
   el.addEventListener("change", build);
 }
 $("stripGut").addEventListener("change", build);

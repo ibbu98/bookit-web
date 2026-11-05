@@ -70,11 +70,16 @@ You can force **Text** or **Pages** by hand.
 - Page books: 1 bit per pixel (black / white), each page drawn for **portrait
   (480 × 800)** or **landscape (800 × 480)**. Text is drawn sharp; pictures are
   dithered (newspaper-style dots).
-- PDFs: **Whole page** (default) fits every page whole on one screen in its own
-  shape, so a portrait Quran page stays one portrait page. **Fit width** gives
-  bigger text but cuts tall pages into strips.
-- On BookiT, *Settings → Orientation* turns the whole device. A page whose shape
-  doesn't match is shrunk to fit whole; switch Orientation to see it full size.
+- **Both orientations (default):** the page makes two sets of pages in one file,
+  one for BookiT held **portrait** and one for **landscape**. BookiT shows the set
+  that matches *Settings → Orientation* and keeps your place when you switch.
+  - PDFs: portrait = every page **whole** on one screen; landscape = tall pages
+    fitted to the width (in 2-3 parts, bigger text), wide pages whole.
+  - Drawn text (Arabic, Tamil, ...): laid out separately for each shape.
+  - The file is about twice as big. Choose *Portrait* or *Landscape* only to
+    make it smaller.
+- If a page's shape doesn't match how BookiT is held (single-set books), it is
+  shrunk to fit whole.
 
 ## What you need
 
@@ -129,6 +134,10 @@ PackBits-compressed 48 000-byte frame in the panel's physical 800 x 480 layout
 turned: physical x = y, physical y = 479 - x. The bottom 32 rows of each page (as
 seen) are left blank for BookiT's page number. Older `"BKP1"` files (no portrait
 table, all landscape) still open.
+
+A BKP2 file may hold **two sets**: all portrait pages first, then all
+landscape pages (each set contiguous). BookiT shows the set matching its
+orientation; a file with one kind of page shows all pages.
 
 Libraries loaded from cdnjs: [pdf.js](https://mozilla.github.io/pdf.js/) 3.11.174
 (Apache-2.0) and [JSZip](https://stuk.github.io/jszip/) 3.10.1 (MIT).
