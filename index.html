@@ -806,15 +806,25 @@ async function sendBook() {
   let off = 0;
   while (off < data.length) {
     while (off - acked >= WINDOW) {                        // wait for BookiT to save to SD
-      const m = await waitFor([EVT_ACK], 15000);
+      const m = await waitFor([EVT_ACK], 30000);
       if (m.type === EVT_ERROR) throw new Error(ERRORS[m.code] || "error " + m.code);
     }
     const end = Math.min(off + chunk, data.length);
-    await dataChar.writeValueWithoutResponse(data.slice(off, end));
+    // Android Chrome sometimes rejects a write when its queue is busy: retry.
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await dataChar.writeValueWithoutResponse(data.slice(off, end));
+        break;
+      } catch (e) {
+        if (attempt >= 5 || !device.gatt.connected) throw new Error("Bluetooth write failed: " + e.message);
+        log(`write retry ${attempt} at byte ${off}: ${e.message}`);
+        await sleep(50 * attempt);
+      }
+    }
     off = end;
   }
   while (acked < data.length) {
-    const m = await waitFor([EVT_ACK], 15000);
+    const m = await waitFor([EVT_ACK], 30000);
     if (m.type === EVT_ERROR) throw new Error(ERRORS[m.code] || "error " + m.code);
   }
 
