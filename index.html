@@ -780,17 +780,38 @@ async function sendStart(size, name) {
   new DataView(pkt.buffer).setUint32(1, size, true);
   pkt.set(nameBytes, 5);
 
-  // If BookiT asks for pairing, the phone shows a code prompt; retry until paired.
-  for (let attempt = 0; attempt < 30; attempt++) {
-    const reply = waitFor([EVT_READY], 8000);
-    await ctrlChar.writeValueWithResponse(pkt);
+  // If BookiT asks for pairing, the phone shows a code prompt. While that
+  // prompt is open, Android holds Bluetooth messages, so a missing answer
+  // here means "keep waiting", not "failed". Retry for up to ~90 s.
+  const t0 = performance.now();
+  while (performance.now() - t0 < 90000) {
+    const reply = waitFor([EVT_READY], 10000).catch(() => null);
+    try {
+      await ctrlChar.writeValueWithResponse(pkt);
+    } catch (e) {
+      log("START write not accepted yet: " + e.message);
+      await sleep(2000);
+      continue;
+    }
     const m = await reply;
+    if (!m) {
+      setStatus("Waiting for BookiT... (if a pairing prompt is open, type the code shown on BookiT)");
+      continue;
+    }
     if (m.type === EVT_READY) return m.chunk;
-    if (m.code !== 8) throw new Error(ERRORS[m.code] || "error " + m.code);
-    setStatus("Pairing: type the 6-digit code shown on BookiT into the prompt.");
-    await sleep(3000);
+    if (m.code === 8) {
+      setStatus("Pairing: type the 6-digit code shown on BookiT into the prompt.");
+      await sleep(2000);
+      continue;
+    }
+    if (m.code === 1) {                                  // an earlier START got through: restart
+      await ctrlChar.writeValueWithResponse(new Uint8Array([CMD_ABORT])).catch(() => {});
+      await sleep(500);
+      continue;
+    }
+    throw new Error(ERRORS[m.code] || "error " + m.code);
   }
-  throw new Error("pairing did not finish");
+  throw new Error("pairing did not finish (check the code on BookiT)");
 }
 
 async function sendBook() {
